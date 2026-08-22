@@ -176,3 +176,87 @@ class KHIPUResonanceNet:
             "Wq": dWq_total, "bq": dbq_total,
             "w_resonant": dw_res, "w_other": dw_other,
         }
+
+class KHIPUResonanceNetMLP:
+    """
+    Wariant KHIPUResonanceNet, ktory zastepuje dwa skalary
+    (w_resonant/w_other) pelnym 2-warstwowym MLP nad konkatenacja
+    [q_i, q_i+1] (18-wym., dyskretne +/-1) - ten sam rozmiar ukryty co
+    BaselinePairwiseMLP, zeby porownanie bylo uczciwe pod wzgledem
+    pojemnosci agregacji. Izoluje pytanie: czy KHIPUResonanceNet
+    przegrywa z BaselinePairwiseMLP z powodu SLABEJ AGREGACJI (2 skalary),
+    czy z powodu SAMEJ KWANTYZACJI (STE)?
+
+    WAZNE uproszczenie wzgledem KHIPUResonanceNet: tutaj NIE MA iloczynu
+    dwoch niezaleznie kwantyzowanych wektorow (to byla zrodlo subtelnego
+    bledu w gradiencie KHIPUResonanceNet - patrz git log). q_i i q_i+1
+    sa tu po prostu SKLEJONE (konkatenacja), potem liniowo zmieszane przez
+    W1 - to jest zwykla warstwa liniowa, gradient wzgledem q_i to po prostu
+    odpowiedni fragment W1 (bez adnej dodatkowej subtelnosci STE poza
+    tym, co juz robi State9Bottleneck.backward). Prostsze i mniej podatne
+    na bledy niz wersja z iloczynem skalarnym.
+    """
+
+    def __init__(self, d_embed: int, hidden: int, rng: np.random.Generator):
+        self.bottleneck = State9Bottleneck(d_in=d_embed, rng=rng)
+        d_in = 2 * N_AXES
+        scale1 = 1.0 / np.sqrt(d_in)
+        scale2 = 1.0 / np.sqrt(hidden)
+        self.W1 = rng.normal(0, scale1, size=(hidden, d_in))
+        self.b1 = np.zeros(hidden)
+        self.w2 = rng.normal(0, scale2, size=hidden)
+        self.b2 = np.zeros(1)
+
+    def params(self):
+        p = dict(self.bottleneck.params())
+        p.update({"W1": self.W1, "b1": self.b1, "w2": self.w2, "b2": self.b2})
+        return p
+
+    def forward(self, seq: np.ndarray):
+        T = seq.shape[0]
+        codes = [self.bottleneck.forward(seq[i]) for i in range(T)]
+        cache = {"codes": codes, "seq": seq, "T": T, "z": [], "h": []}
+        pred = 0.0
+        for i in range(T - 1):
+            z = np.concatenate([codes[i], codes[i + 1]])  # (18,)
+            h = np.tanh(self.W1 @ z + self.b1)
+            s = float(self.w2 @ h + self.b2[0])
+            pred += s
+            cache["z"].append(z)
+            cache["h"].append(h)
+        return pred, cache
+
+    def backward(self, dL_dpred: float, cache):
+        T = cache["T"]
+        codes = cache["codes"]
+        dW1 = np.zeros_like(self.W1)
+        db1 = np.zeros_like(self.b1)
+        dw2 = np.zeros_like(self.w2)
+        db2 = np.zeros(1)
+        dL_dq = [np.zeros(N_AXES) for _ in range(T)]
+
+        for i in range(T - 1):
+            z, h = cache["z"][i], cache["h"][i]
+            dL_ds = dL_dpred
+            dw2 += dL_ds * h
+            db2[0] += dL_ds
+            dL_dh = dL_ds * self.w2
+            dL_dpre = dL_dh * (1.0 - h ** 2)
+            dW1 += np.outer(dL_dpre, z)
+            db1 += dL_dpre
+            dL_dz = self.W1.T @ dL_dpre          # (18,)
+            dL_dq[i] += dL_dz[:N_AXES]
+            dL_dq[i + 1] += dL_dz[N_AXES:]
+
+        dWq_total = np.zeros_like(self.bottleneck.Wq)
+        dbq_total = np.zeros_like(self.bottleneck.bq)
+        for i in range(T):
+            self.bottleneck.forward(cache["seq"][i])
+            _, grads = self.bottleneck.backward(dL_dq[i])
+            dWq_total += grads["Wq"]
+            dbq_total += grads["bq"]
+
+        return {
+            "Wq": dWq_total, "bq": dbq_total,
+            "W1": dW1, "b1": db1, "w2": dw2, "b2": db2,
+        }
