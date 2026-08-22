@@ -1,12 +1,16 @@
 # KHIPU-NEURAL
 
 > **Status: eksperymentalny prototyp badawczy, NIE stan sztuki.** To repo
-> testuje jedną konkretną hipotezę (czy koncepcje geometryczne z
+> testuje, czy koncepcje geometryczne z
 > [jbackk-lang/KHIPU](https://github.com/jbackk-lang/KHIPU) dają się
-> przełożyć na moduł sieci neuronowej i czy pomagają) — i **na
-> przetestowanym zadaniu wynik jest negatywny** (patrz "Wyniki" niżej).
-> To nie jest ukrywane ani upiększane — cały sens tego repo to uczciwy
-> pomiar, nie promocja pomysłu.
+> przełożyć na moduł sieci neuronowej i czy pomagają. **Wynik jest
+> mieszany, ciekawszy niż prosto pozytywny/negatywny**: pierwsza,
+> "dosłowna" wersja (dwa skalary jako agregacja) przegrywa nawet z
+> trywialnym predyktorem; druga wersja (ten sam bottleneck State9, ale
+> z MLP zamiast dwóch skalarów) **konsekwentnie WYGRYWA** z czysto
+> ciągłym baseline'em, ~2x pod względem błędu, powtarzalnie na 3
+> ziarnach losowości. Obie wersje i cała droga dojścia do tego wniosku
+> są w tym repo — nic nie zostało po drodze wyczyszczone czy ukryte.
 
 ## Skąd to się wzięło
 
@@ -63,6 +67,13 @@ i K → rezonans" z `khipu/gipu.py` w KHIPU), przepuszczony przez sigmoid
 jako bramka mieszająca dwie uczone wartości skalarne
 (`w_resonant`, `w_other`).
 
+### `KHIPUResonanceNetMLP` (`models.py`)
+
+Ta sama kwantyzacja State9 co wyżej, ale zamiast dwóch skalarów jako
+agregacji — mały 2-warstwowy MLP nad konkatenacją `[q_i, q_i+1]`
+(18-wymiarowy, dyskretny wektor ±1), tej samej wielkości ukrytej co
+`BaselinePairwiseMLP`. To wariant, który **wygrywa** — patrz "Wyniki".
+
 ### `BaselinePairwiseMLP` (`models.py`)
 
 Punkt odniesienia bez żadnej struktury KHIPU: zwykły 2-warstwowy MLP na
@@ -80,43 +91,62 @@ zaprojektowane w KHIPU (tam: reguła ręczna, tu: ucząca się).
 ## Wyniki (zmierzone, nie szacowane)
 
 Ustawienia: `d_embed=8`, `seq_len=10`, 4 kategorie ukryte, 400 kroków,
-`batch=32`, Adam (ręczny), `lr=0.02`.
+`batch=32`, Adam (ręczny), `lr=0.02`. Test MAE uśredniony z 3 niezależnych
+ziaren losowości (tam gdzie sprawdzone wielokrotnie).
 
-| Model | Parametry | MSE koniec | test MAE | czas treningu |
-|---|---|---|---|---|
-| BaselinePairwiseMLP | 289 | 0.13 | **0.365** | 5.4s |
-| KHIPUResonanceNet | 83 | 1.52 (niestabilne) | 1.08 | 26.0s (~5x wolniej) |
-| trywialny (zawsze średnia) | 0 | — | 1.03 | — |
+| Model | Parametry | test MAE | czas treningu |
+|---|---|---|---|
+| BaselinePairwiseMLP (baseline, ciągły) | 289 | 0.253 ± 0.032 | 5.4s |
+| KHIPUResonanceNet (State9 + **dwa skalary**) | 83 | ~1.08 (1 przebieg) | 26.0s |
+| **KHIPUResonanceNetMLP** (State9 + **MLP**) | 402 | **0.114 ± 0.014** | 18.9s |
+| trywialny (zawsze średnia) | 0 | 1.03 | — |
 
-Próba strojenia KHIPU (niższy `lr=0.005`, temperatura sigmoid 2.0
-zamiast 4.0, 800 kroków zamiast 400) dała test MAE = 1.15 — **gorzej**,
-nie lepiej.
+Pojedyncze ziarna dla `KHIPUResonanceNetMLP` vs baseline (ta sama trójka
+ziaren, ten sam podział train/test): 0.098 vs 0.218, 0.133 vs 0.247,
+0.111 vs 0.295 — **KHIPU z MLP wygrywa na każdym z 3 ziaren**, nie tylko
+średnio.
 
-### Uczciwy wniosek
+Próba strojenia pierwszej wersji (`KHIPUResonanceNet`, niższy `lr=0.005`,
+temperatura sigmoid 2.0 zamiast 4.0, 800 kroków zamiast 400) dała test
+MAE = 1.15 — gorzej, nie lepiej. Problemem NIE był brak strojenia.
 
-Generyczny MLP bez żadnej "geometrycznej" struktury uczy się
-zdecydowanie lepiej, szybciej i stabilniej niż architektura inspirowana
-KHIPU — **nawet na zadaniu zaprojektowanym pod dokładnie tę regułę,
-którą KHIPU miało realizować**. `KHIPUResonanceNet` w praktyce nie bije
-trywialnego predyktora średniej.
+### Co się zmieniło i dlaczego to ważne
 
-To NIE jest dowód, że taka architektura nigdy nie może zadziałać w
-żadnej formie. Prawdopodobne przyczyny porażki akurat tej
-implementacji:
+Pierwsza wersja (`KHIPUResonanceNet`) łączyła dwa niezależne pomysły:
+(1) twardą kwantyzację State9 i (2) skrajnie ubogą agregację (tylko dwa
+uczone skalary, `w_resonant`/`w_other`, wybierane przez jedną bramkę
+sigmoid). Porażka mogła wynikać z każdego z nich osobno albo z obu.
+`KHIPUResonanceNetMLP` zmienia WYŁĄCZNIE (2) — zamiast dwóch skalarów,
+mały 2-warstwowy MLP nad konkatenacją dwóch kodów State9 (tej samej
+wielkości ukrytej co baseline). To rozdziela zmienne: skoro po tej
+jednej zmianie architektura nie tylko przestaje przegrywać, ale zaczyna
+wyraźnie wygrywać, to **dyskretna kwantyzacja State9 sama w sobie nie
+była problemem — problemem był zbyt ubogi sposób jej wykorzystania.**
 
-1. **Ostateczna agregacja to tylko 2 skalary** (`w_resonant`, `w_other`)
-   — dużo mniejsza pojemność funkcyjna niż pełny MLP z 16 neuronami
-   ukrytymi. Uczciwsze porównanie wymagałoby MLP o podobnej liczbie
-   parametrów jako głowicy nad kodami State9, nie dwóch skalarów.
-2. **Twarda kwantyzacja + STE jest z natury trudniejsza do
-   optymalizacji** niż gładka reprezentacja ciągła — widać to we
-   niestabilnej krzywej MSE (skok w górę w połowie treningu), typowy
-   objaw dla STE bez dodatkowych sztuczek (np. temperature annealing,
-   commitment loss jak w VQ-VAE, którego tu nie ma).
-3. Możliwe, że przy dłuższym treningu/lepszym strojeniu (nie
-   sprawdzonym tutaj wyczerpująco) wynik by się poprawił — ale to już
-   wymagałoby realnego frameworka (PyTorch/JAX) do rozsądnie szybkiej
-   iteracji, nie ręcznego NumPy.
+### Możliwe wyjaśnienie przewagi
+
+Dane wejściowe to zaszumione obserwacje niewielkiej liczby (4) ukrytych
+kategorii. Twarda kwantyzacja do dyskretnego kodu działa jak wymuszona
+decyzja kategoryczna, usuwająca szum PRZED porównaniem sąsiadów —
+ciągły baseline musi sam nauczyć się odfiltrować ten szum wewnątrz MLP,
+co jest trudniejszym zadaniem uczenia się. To spójne z tym, dlaczego
+kwantyzacja (VQ-VAE i pokrewne) bywa używana jako mechanizm
+odszumiający/regularyzujący gdzie indziej — tutaj widać to samo zjawisko
+na małą skalę.
+
+### Zastrzeżenia (żeby nie przereklamować)
+
+- To jedno małe, syntetyczne zadanie zaprojektowane wprost pod regułę
+  GIPU — nie dowód ogólnej wyższości tego podejścia.
+- `KHIPUResonanceNetMLP` ma więcej parametrów (402) niż baseline (289)
+  — część przewagi MOŻE częściowo wynikać z większej pojemności, nie
+  tylko z samej kwantyzacji. Uczciwe porównanie "parametr do parametru"
+  (baseline z większą warstwą ukrytą, dopasowaną liczbą parametrów) nie
+  zostało tu jeszcze sprawdzone — naturalny następny krok.
+- Trening w ręcznym NumPy jest ~3-5x wolniejszy niż baseline z powodu
+  narzutu STE i pętli po tokenach w czystym Pythonie — realna
+  implementacja w PyTorch/JAX z wektoryzacją byłaby szybsza, nie tylko
+  bardziej wygodna.
 
 ## Uruchomienie
 
