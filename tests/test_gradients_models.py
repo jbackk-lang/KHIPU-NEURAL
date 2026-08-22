@@ -127,3 +127,83 @@ def test_khipu_wq_bq_gradients_match_ste_numerical():
 
     max_err_Wq = np.max(np.abs(num_grad_Wq - grads["Wq"]))
     assert max_err_Wq < 1e-4, f"Wq (STE) max_err={max_err_Wq}"
+
+
+def test_khipu_mlp_gradients_match_ste_numerical():
+    """KHIPUResonanceNetMLP: sprawdzamy Wq/bq (STE) i W1/b1/w2/b2 (zwykly
+    backprop). Konkatenacja (nie iloczyn) - prostszy przypadek STE niz
+    w KHIPUResonanceNet, gradient dL_dq to po prostu odpowiedni fragment
+    W1.T @ dL_dpre, bez zadnej dodatkowej subtelnosci."""
+    from khipu_neural.models import KHIPUResonanceNetMLP
+
+    rng = np.random.default_rng(20)
+    d, T, hidden = 3, 5, 4
+    model = KHIPUResonanceNetMLP(d_embed=d, hidden=hidden, rng=rng)
+    seq = rng.normal(size=(T, d))
+
+    pred, cache = model.forward(seq)
+    grads = model.backward(1.0, cache)
+
+    eps = 1e-5
+
+    # W1/b1/w2/b2: zwykly numeryczny check na PRAWDZIWYM (twardym) forward -
+    # tu NIE MA problemu z STE (kody sa juz policzone przez bottleneck,
+    # a warstwa liniowa nad nimi jest zwykla, wiec forward jest lokalnie
+    # stala wzgledem tych parametrow tylko przez q, ktore samo NIE zalezy
+    # od W1/b1/w2/b2 - wiec finite differences na prawdziwym forward jest
+    # tu w pelni poprawne, bez linearyzacji).
+    for name in ("W1", "b1", "w2", "b2"):
+        param = getattr(model, name)
+        flat = param.flatten().copy()
+        num_grad = np.zeros_like(flat)
+        for i in range(len(flat)):
+            plus = flat.copy(); plus[i] += eps
+            minus = flat.copy(); minus[i] -= eps
+
+            def set_and_forward(v):
+                old = getattr(model, name).copy()
+                getattr(model, name)[...] = v.reshape(old.shape)
+                p, _ = model.forward(seq)
+                getattr(model, name)[...] = old
+                return p
+
+            num_grad[i] = (set_and_forward(plus) - set_and_forward(minus)) / (2 * eps)
+
+        ana = grads[name].flatten()
+        max_err = np.max(np.abs(num_grad - ana))
+        assert max_err < 1e-4, f"{name}: max_err={max_err}"
+
+    # Wq/bq: STE, ta sama zlinearyzowana metoda co w innych testach w tym pliku
+    Wq0 = model.bottleneck.Wq.copy()
+    bq0 = model.bottleneck.bq.copy()
+    t0_list, q0_list = [], []
+    for i in range(T):
+        t, q = _quantize(Wq0, bq0, seq[i])
+        t0_list.append(t); q0_list.append(q)
+
+    def pred_from_codes(codes):
+        p = 0.0
+        for i in range(T - 1):
+            z = np.concatenate([codes[i], codes[i + 1]])
+            h = np.tanh(model.W1 @ z + model.b1)
+            p += float(model.w2 @ h + model.b2[0])
+        return p
+
+    def numerical_grad_wq(idx):
+        Wp = Wq0.copy(); Wp[idx] += eps
+        Wm = Wq0.copy(); Wm[idx] -= eps
+        codes_p, codes_m = [], []
+        for i in range(T):
+            tp, _ = _quantize(Wp, bq0, seq[i])
+            tm, _ = _quantize(Wm, bq0, seq[i])
+            codes_p.append(q0_list[i] + (tp - t0_list[i]))
+            codes_m.append(q0_list[i] + (tm - t0_list[i]))
+        return (pred_from_codes(codes_p) - pred_from_codes(codes_m)) / (2 * eps)
+
+    num_grad_Wq = np.zeros_like(Wq0)
+    it = np.nditer(Wq0, flags=["multi_index"])
+    for _ in it:
+        num_grad_Wq[it.multi_index] = float(numerical_grad_wq(it.multi_index))
+
+    max_err_Wq = np.max(np.abs(num_grad_Wq - grads["Wq"]))
+    assert max_err_Wq < 1e-4, f"Wq (STE, MLP head) max_err={max_err_Wq}"
