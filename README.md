@@ -8,9 +8,14 @@
 > "dosłowna" wersja (dwa skalary jako agregacja) przegrywa nawet z
 > trywialnym predyktorem; druga wersja (ten sam bottleneck State9, ale
 > z MLP zamiast dwóch skalarów) **konsekwentnie WYGRYWA** z czysto
-> ciągłym baseline'em, ~2x pod względem błędu, powtarzalnie na 3
-> ziarnach losowości. Obie wersje i cała droga dojścia do tego wniosku
-> są w tym repo — nic nie zostało po drodze wyczyszczone czy ukryte.
+> ciągłym baseline'em, ~2x pod względem błędu, powtarzalnie na 4
+> ziarnach losowości. **Kontrolny eksperyment (`ablation.py`) pokazał
+> jednak, że ta przewaga NIE bierze się z dyskretnej kwantyzacji State9
+> samej w sobie** — bierze się głównie z wąskiego gardła wymiarowego
+> (bottleneck do 9 osi) jako takiego; wersja bez twardej kwantyzacji
+> wypada niemal identycznie. To ważna korekta wcześniejszego wniosku,
+> nie ukryta pod dywan — patrz "Kontrola: skąd naprawdę bierze się
+> przewaga?" niżej.
 
 ## Skąd to się wzięło
 
@@ -106,6 +111,11 @@ ziaren, ten sam podział train/test): 0.098 vs 0.218, 0.133 vs 0.247,
 0.111 vs 0.295 — **KHIPU z MLP wygrywa na każdym z 3 ziaren**, nie tylko
 średnio.
 
+Rozszerzone na 4 ziarna (1,2,3,4) w kontrolnym eksperymencie
+(`ablation.py`, patrz niżej): `KHIPUResonanceNetMLP` = 0.133 ± 0.033,
+baseline (289) = 0.286 ± 0.062 — przewaga utrzymuje się, liczby lekko
+się przesuwają bo to inny podział ziaren losowości niż w `compare.py`.
+
 Próba strojenia pierwszej wersji (`KHIPUResonanceNet`, niższy `lr=0.005`,
 temperatura sigmoid 2.0 zamiast 4.0, 800 kroków zamiast 400) dała test
 MAE = 1.15 — gorzej, nie lepiej. Problemem NIE był brak strojenia.
@@ -134,15 +144,57 @@ kwantyzacja (VQ-VAE i pokrewne) bywa używana jako mechanizm
 odszumiający/regularyzujący gdzie indziej — tutaj widać to samo zjawisko
 na małą skalę.
 
+### Kontrola: skąd naprawdę bierze się przewaga? (`ablation.py`, 2026-08)
+
+Powyższa sekcja "Możliwe wyjaśnienie przewagi" (kwantyzacja jako
+odszumianie) była **hipotezą, nie sprawdzonym faktem** w momencie
+napisania. Żeby ją sprawdzić, dodano `khipu_neural/ablation.py`, który
+trenuje 4 warianty na tych samych 4 ziarnach losowości (1,2,3,4):
+
+| Model | Parametry | test MAE (śr. ± std) |
+|---|---|---|
+| BaselinePairwiseMLP (hidden=16) | 289 | 0.286 ± 0.062 |
+| BaselinePairwiseMLP **dopasowany** (hidden=22) | 397 | 0.260 ± 0.035 |
+| **KHIPUResonanceNetMLP** (State9 + MLP) | 402 | **0.133 ± 0.033** |
+| KHIPUResonanceNetMLPNoQuant (bottleneck **bez** kwantyzacji) | 402 | 0.142 ± 0.049 |
+
+Dwa pytania kontrolne i odpowiedzi:
+
+1. **Czy to tylko więcej parametrów?** Nie. Baseline dopasowany do 397
+   parametrów (blisko 402 w KHIPU) poprawia się ledwo zauważalnie
+   (0.260 vs 0.286) — dalej ogromna przepaść do ~0.13-0.14. Liczba
+   parametrów NIE tłumaczy wyniku.
+2. **Czy to twarda kwantyzacja State9?** Też nie, a przynajmniej nie
+   głównie. Wersja BEZ kwantyzacji (ciągły bottleneck 9-wymiarowy,
+   `tanh` zamiast `sign`) wypada praktycznie tak samo jak wersja
+   skwantyzowana (0.142 vs 0.133 — w granicach błędu na 4 ziarnach:
+   KHIPU-z-kwantyzacją wygrywa na 3/4 ziaren, bez kwantyzacji na 1/4).
+
+**Poprawiony wniosek**: przewaga bierze się głównie z samego
+**wąskiego gardła wymiarowego** (rzutowanie do 9 osi przed
+porównaniem sąsiadów) — dobrze znanego efektu z uczenia reprezentacji
+(information bottleneck, autoenkodery), NIE ze specyficznie
+"geometrycznej"/dyskretnej natury State9. Twarda kwantyzacja State9 w
+tym zadaniu nie szkodzi, ale też wyraźnie nie pomaga ponad to, co daje
+już sama redukcja wymiarowości. To osłabia (ale nie unieważnia)
+wcześniejszą hipotezę "kwantyzacja jako odszumianie" — jest częścią
+sprawiedliwego zapisu wyników w tym repo, żeby nie zostawić
+przereklamowanej wersji wniosku.
+
+Uruchomienie: `python3 -m khipu_neural.ablation` (~3-4 min, 4 ziarna ×
+4 modele).
+
 ### Zastrzeżenia (żeby nie przereklamować)
 
 - To jedno małe, syntetyczne zadanie zaprojektowane wprost pod regułę
   GIPU — nie dowód ogólnej wyższości tego podejścia.
-- `KHIPUResonanceNetMLP` ma więcej parametrów (402) niż baseline (289)
-  — część przewagi MOŻE częściowo wynikać z większej pojemności, nie
-  tylko z samej kwantyzacji. Uczciwe porównanie "parametr do parametru"
-  (baseline z większą warstwą ukrytą, dopasowaną liczbą parametrów) nie
-  zostało tu jeszcze sprawdzone — naturalny następny krok.
+- Kontrola parametrów i kwantyzacji wykonana (patrz wyżej) — ale tylko
+  na 4 ziarnach losowości i jednej konfiguracji zadania (`d_embed=8`,
+  4 kategorie, `seq_len=10`). Różnica między wariantem z kwantyzacją a
+  bez niej (0.133 vs 0.142) jest zbyt mała względem odchylenia
+  standardowego, żeby twierdzić, że jedno rozstrzygająco bije drugie —
+  potrzeba więcej ziaren, żeby to rozstrzygnąć, jeśli komuś na tym
+  zależy.
 - Trening w ręcznym NumPy jest ~3-5x wolniejszy niż baseline z powodu
   narzutu STE i pętli po tokenach w czystym Pythonie — realna
   implementacja w PyTorch/JAX z wektoryzacją byłaby szybsza, nie tylko
