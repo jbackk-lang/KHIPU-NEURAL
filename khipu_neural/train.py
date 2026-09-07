@@ -55,8 +55,9 @@ def train_baseline(model: BaselinePairwiseMLP, dataset: ResonanceDataset,
     return _train(model, dataset, steps, batch_size, lr)
 
 
-def train_khipu(model: KHIPUResonanceNet, dataset: ResonanceDataset,
+def train_khipu(model, dataset: ResonanceDataset,
                  steps: int, batch_size: int, lr: float):
+    """Dziala z KHIPUResonanceNet ORAZ KHIPUResonanceNetMLP (ten sam interfejs)."""
     return _train(model, dataset, steps, batch_size, lr)
 
 
